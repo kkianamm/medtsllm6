@@ -255,86 +255,115 @@ def statistics_based_prompt_selection(scores, tau):
 # BiomedCoOp prototype classification head
 # ----------------------------------------------------------------------------
 class BiomedCoOpHead(nn.Module):
-    """Prototype (CLIP-style) classifier with KDSP / SCCM regularisation.
+    """BiomedCoOp text-prototype *guidance* for a strong learnable classifier.
 
-    The host model supplies:
-      * `class_prototypes`: frozen per-class, per-prompt text embeddings of the
-        descriptions, shape [n_cls, n_prompts, d_llm] (encoded once by the
-        frozen LLM and pooled over tokens).
-      * `ts_emb`: the pooled LLM output over the time-series patches, shape
-        [bs, d_llm]  (the "sample" embedding, analogous to CLIP image features).
+    IMPORTANT CHANGE vs. the first port: the text prototypes no longer *replace*
+    the classifier. Doing that (cosine to 5 frozen text vectors) is a tiny,
+    frozen, mis-aligned head and it underfits — on a non-CLIP backbone the
+    time-series space and the text-encoder space are not aligned, and the 5
+    ECG-superclass prototypes are nearly collinear (shared ECG vocabulary).
 
-    Forward returns class logits. During training it also stores the auxiliary
-    KDSP (+ optional SCCM) loss; the host model exposes it as `self.aux_loss`,
-    which `tasks/classification.py` already adds to the cross-entropy loss.
+    Instead the host model keeps its full learnable head (FlattenHead) as the
+    classifier, and this module adds BiomedCoOp as *auxiliary* losses that shape
+    the representation:
+
+      * ALIGN - the text prototypes act as an auxiliary classifier
+        (CE on cosine logits). This is the BiomedCoOp / CoOp "text-as-classifier"
+        idea, but as a guidance task in parallel with the main head, so it
+        injects the semantic prior without throttling capacity.
+      * KDSP  - distil the SPS-selected zero-shot prototype logits into the MAIN
+        head (KL), with statistics-based prompt selection.
+      * SCCM  - optional MSE consistency (off by default; needs a learnable
+        text prompt to be fully faithful).
+
+    The host supplies the pooled time-series embedding `ts_emb [bs, d_llm]`, the
+    frozen `class_prototypes [n_cls, n_prompts, d_llm]`, and the MAIN head logits
+    `main_logits [bs, n_cls]`. `self.aux_loss` is read by the model and added to
+    cross-entropy in `tasks/classification.py`.
     """
 
-    def __init__(self, d_llm, n_cls, tau=2.0, kdsp_lambda=1.0, sccm_lambda=0.0,
-                 logit_scale_init=4.6052, learnable_scale=True):
+    def __init__(self, d_llm, n_cls, tau=2.0, align_lambda=1.0, kdsp_lambda=0.3,
+                 sccm_lambda=0.0, center_prototypes=True,
+                 logit_scale_init=2.6593, learnable_scale=True):
         super().__init__()
         self.n_cls = n_cls
         self.tau = tau
+        self.align_lambda = align_lambda
         self.kdsp_lambda = kdsp_lambda
         self.sccm_lambda = sccm_lambda
+        self.center_prototypes = center_prototypes
 
-        # Projection of the time-series sample embedding into the (frozen) text
-        # prototype space. Initialised near identity so training starts close to
-        # a plain zero-shot prototype classifier.
-        self.ts_proj = nn.Linear(d_llm, d_llm, bias=False)
-        nn.init.eye_(self.ts_proj.weight)
+        # Map the time-series embedding into the text-prototype space. With a
+        # bias and a non-identity init this is a real (small) learnable head for
+        # the auxiliary alignment task, not just a rotation.
+        self.ts_proj = nn.Linear(d_llm, d_llm, bias=True)
 
-        # Temperature, like CLIP's logit_scale (stored in log space).
         scale = torch.tensor(float(logit_scale_init))
         if learnable_scale:
             self.logit_scale = nn.Parameter(scale)
         else:
             self.register_buffer("logit_scale", scale)
 
-        self.aux_loss = None  # set during training
+        self.aux_loss = None
 
-    def forward(self, ts_emb, class_prototypes, labels=None):
-        # ts_emb: [bs, d_llm] ; class_prototypes: [n_cls, n_prompts, d_llm]
-        proto = class_prototypes.to(ts_emb.dtype)
-        proto = proto / proto.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        proto_mean = proto.mean(dim=1)                                   # [n_cls, d_llm]
-        proto_mean = proto_mean / proto_mean.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    @staticmethod
+    def _norm(x):
+        return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 
+    def _class_prototypes(self, proto):
+        """proto: [n_cls, n_prompts, d] -> normalized class prototypes [n_cls, d].
+
+        Optional centering removes the component shared by all classes (the
+        generic "ECG-ness" direction), which sharpens inter-class separation.
+        """
+        pm = proto.mean(dim=1)                                  # [n_cls, d]
+        if self.center_prototypes:
+            pm = pm - pm.mean(dim=0, keepdim=True)
+        return self._norm(pm)
+
+    def forward(self, ts_emb, class_prototypes, main_logits=None, labels=None):
+        proto = self._norm(class_prototypes.to(ts_emb.dtype))   # [n_cls, n_prompts, d]
+        proto_mean = self._class_prototypes(proto)              # [n_cls, d]
         scale = self.logit_scale.exp().clamp(max=100.0)
 
-        # --- student head: learned projection vs mean prototypes ---
-        feat = self.ts_proj(ts_emb)
-        feat = feat / feat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        logits = scale * feat @ proto_mean.t()                          # [bs, n_cls]
+        feat = self._norm(self.ts_proj(ts_emb))                 # [bs, d]
+        proto_logits = scale * feat @ proto_mean.t()            # [bs, n_cls]  (aux classifier)
 
-        if labels is None or not self.training:
+        if not self.training or labels is None:
             self.aux_loss = None
-            return logits
+            return proto_logits
 
-        # --- KDSP: distil SPS-selected zero-shot prototypes into the head ---
-        with torch.no_grad():
-            zs = ts_emb / ts_emb.norm(dim=-1, keepdim=True).clamp_min(1e-8)  # zero-shot feature (no learned proj)
-            # per-prompt alignment score s_p = mean_b max_c <zs, proto[:,p,:]>
-            scores = []
-            for p in range(proto.shape[1]):
-                tl = scale * zs @ proto[:, p, :].t()                    # [bs, n_cls]
-                scores.append(tl.max(dim=1).values.mean())
-            scores = torch.stack(scores)                                # [n_prompts]
-            mask = statistics_based_prompt_selection(scores, self.tau)
-            selected = proto[:, mask, :].mean(dim=1)                    # [n_cls, d_llm]
-            selected = selected / selected.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-            zero_shot_logits = scale * zs @ selected.t()                # [bs, n_cls]
+        aux = ts_emb.new_zeros(())
 
-        loss_kdsp = F.kl_div(
-            F.log_softmax(logits, dim=1),
-            F.log_softmax(zero_shot_logits, dim=1),
-            reduction="sum", log_target=True,
-        ) / logits.numel()
+        # (1) ALIGN: text prototypes as an auxiliary classifier -> shapes the
+        #     shared time-series representation toward the semantic class layout.
+        if self.align_lambda > 0:
+            aux = aux + self.align_lambda * F.cross_entropy(proto_logits, labels)
 
-        aux = self.kdsp_lambda * loss_kdsp
+        # (2) KDSP: distil SPS-selected zero-shot prototypes into the MAIN head.
+        if self.kdsp_lambda > 0 and main_logits is not None:
+            with torch.no_grad():
+                zs = self._norm(ts_emb)                          # zero-shot feature (no learned proj)
+                scores = torch.stack([
+                    (scale * zs @ proto[:, p, :].t()).max(dim=1).values.mean()
+                    for p in range(proto.shape[1])
+                ])
+                mask = statistics_based_prompt_selection(scores, self.tau)
+                sel = proto[:, mask, :].mean(dim=1)              # [n_cls, d]
+                if self.center_prototypes:
+                    sel = sel - sel.mean(dim=0, keepdim=True)
+                sel = self._norm(sel)
+                zero_shot_logits = scale * zs @ sel.t()          # [bs, n_cls]
+            loss_kdsp = F.kl_div(
+                F.log_softmax(main_logits, dim=1),
+                F.log_softmax(zero_shot_logits, dim=1),
+                reduction="sum", log_target=True,
+            ) / main_logits.numel()
+            aux = aux + self.kdsp_lambda * loss_kdsp
 
-        # --- optional SCCM: pull mean prototypes & student head together ---
+        # (3) SCCM (optional): keep the aux head consistent with the prototypes.
         if self.sccm_lambda > 0:
             aux = aux + self.sccm_lambda * F.mse_loss(feat.mean(0), proto_mean.mean(0))
 
         self.aux_loss = aux
-        return logits
+        return proto_logits
