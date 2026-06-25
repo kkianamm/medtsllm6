@@ -90,8 +90,10 @@ class MedTsLLM(nn.Module):
             )
             self.bc_pool = _bcfg.get("pool", "mean")          # "mean" | "last"
             self.bc_tau = _bcfg.get("tau", 2.0)
-            self.bc_kdsp_lambda = _bcfg.get("kdsp_lambda", 1.0)
+            self.bc_align_lambda = _bcfg.get("align_lambda", 1.0)
+            self.bc_kdsp_lambda = _bcfg.get("kdsp_lambda", 0.3)
             self.bc_sccm_lambda = _bcfg.get("sccm_lambda", 0.0)
+            self.bc_center = _bcfg.get("center_prototypes", True)
             assert self.n_classes == len(self.bc_descriptions), (
                 f"biomedcoop expects {self.n_classes} classes, got "
                 f"{len(self.bc_descriptions)} description groups."
@@ -147,8 +149,10 @@ class MedTsLLM(nn.Module):
                 d_llm=self.d_llm,
                 n_cls=self.n_classes,
                 tau=self.bc_tau,
+                align_lambda=self.bc_align_lambda,
                 kdsp_lambda=self.bc_kdsp_lambda,
                 sccm_lambda=self.bc_sccm_lambda,
+                center_prototypes=self.bc_center,
             )
 
         self.embedding_downsample_mode = self.model_config.embedding_downsample_mode
@@ -414,11 +418,9 @@ class MedTsLLM(nn.Module):
 
         dec_out = dec_out[:, -self.n_patches:, :]
 
-        if self.task == "classification" and self.use_biomedcoop:
-            # Prototype (CLIP/CoOp-style) classification: the descriptions are
-            # the classifier. Pool the d_llm patch tokens and score against the
-            # frozen per-class text prototypes (see BiomedCoOpHead).
-            return self._biomedcoop_classify(dec_out, bs, n_features, inputs.get("labels"))
+        # BiomedCoOp uses the d_llm patch tokens as an auxiliary guidance signal;
+        # capture them here, but keep the full learnable head as the classifier.
+        bc_ts_tokens = dec_out if (self.task == "classification" and self.use_biomedcoop) else None
 
         match self.embedding_downsample_mode:
             case "truncate":
@@ -447,6 +449,10 @@ class MedTsLLM(nn.Module):
                 dec_out = dec_out.view(bs, self.n_outputs_per_step)
             if self.n_outputs_per_step == 1:
                 dec_out = dec_out.squeeze(-1)
+            if self.use_biomedcoop:
+                # dec_out are the MAIN (FlattenHead) logits; add BiomedCoOp
+                # alignment + KDSP guidance as an auxiliary loss.
+                self._biomedcoop_aux(bc_ts_tokens, bs, n_features, dec_out, inputs.get("labels"))
             return dec_out
 
         if self.covariate_mode == "independent":
@@ -466,11 +472,31 @@ class MedTsLLM(nn.Module):
 
         return dec_out
 
+    def _get_text_encoder(self):
+        """Return the module that turns text embeddings into contextualized
+        text features.
+
+        For an encoder-decoder backbone (e.g. FLAN-T5) the class descriptions
+        must go through the *encoder* only: calling the full model without
+        decoder inputs would error, and even a successful call would return
+        decoder states, not the text representation we want for prototypes.
+        For a decoder-only backbone the model itself is the text encoder.
+        Handles a PEFT/LoRA wrapper transparently.
+        """
+        llm = getattr(self.llm, "base_model", self.llm)
+        llm = getattr(llm, "model", llm)            # unwrap PeftModel -> base
+        if self.llm.config.is_encoder_decoder:
+            if hasattr(self.llm, "get_encoder"):
+                return self.llm.get_encoder()
+            return llm.get_encoder()
+        return self.llm
+
     def _encode_text_pooled(self, texts):
-        """Encode a list of strings with the frozen LLM and pool over tokens.
+        """Encode a list of strings with the frozen text encoder and pool tokens.
 
         Returns [len(texts), d_llm]. Mirrors a CLIP text encoder: run the text
-        through the (frozen) backbone, then pool (masked-mean or last token).
+        through the (frozen) encoder, then pool (masked-mean or last token).
+        Works for both decoder-only and encoder-decoder backbones.
         """
         tok = self.tokenizer(
             texts, return_tensors="pt", padding=True, truncation=True, max_length=64,
@@ -478,12 +504,14 @@ class MedTsLLM(nn.Module):
         input_ids = tok.input_ids.to(self.device)
         attn = tok.attention_mask.to(self.device)
         embeds = self.llm.get_input_embeddings()(input_ids)
-        out = self.llm(inputs_embeds=embeds, attention_mask=attn).last_hidden_state
+        encoder = self._get_text_encoder()
+        out = encoder(inputs_embeds=embeds, attention_mask=attn).last_hidden_state
         out = out.to(embeds.dtype)
         if self.bc_pool == "last":
+            # T5 has no BOS/EOS-at-start convention issue here; last *real* token.
             idx = attn.sum(dim=1) - 1
             pooled = out[torch.arange(out.size(0), device=out.device), idx]
-        else:  # masked mean
+        else:  # masked mean (recommended for encoder-decoder text encoders)
             m = attn.unsqueeze(-1).to(out.dtype)
             pooled = (out * m).sum(dim=1) / m.sum(dim=1).clamp_min(1e-6)
         return pooled
@@ -505,17 +533,24 @@ class MedTsLLM(nn.Module):
         if was_training:
             self.llm.train()
 
-    def _biomedcoop_classify(self, ts_tokens, bs, n_features, labels=None):
-        """Pool the time-series LLM output and classify against text prototypes."""
+    def _biomedcoop_aux(self, ts_tokens, bs, n_features, main_logits, labels=None):
+        """Compute BiomedCoOp auxiliary guidance from the pooled TS embedding.
+
+        Does not change the prediction (the main FlattenHead logits are
+        returned by the caller); only sets `self.aux_loss`, which
+        `tasks/classification.py` adds to the cross-entropy loss.
+        """
+        if not self.training or labels is None:
+            self.aux_loss = None
+            return
         pooled = ts_tokens.mean(dim=1)                                     # [B0, d_llm]
         if pooled.size(0) != bs:           # independent / merge-end expand by n_features
             pooled = pooled.view(bs, n_features, -1).mean(dim=1)
         if self._bc_prototypes is None:
             self._build_class_prototypes()
         protos = self._bc_prototypes.to(pooled.device)
-        logits = self.bc_head(pooled, protos, labels=labels if self.training else None)
+        self.bc_head(pooled, protos, main_logits=main_logits, labels=labels)
         self.aux_loss = self.bc_head.aux_loss
-        return logits
 
     def build_class_prompt(self):
         import random
