@@ -71,7 +71,9 @@ class_prompts_path = ""        # "" -> built-in ECG templates; or a JSON file
 n_prompts = 16                 # descriptions per class used to build prototypes
 pool = "mean"                  # token pooling for text/TS embeddings: "mean" | "last"
 tau = 2.0                      # SPS outlier threshold (robust z-score)
-kdsp_lambda = 1.0              # weight of the KDSP distillation loss
+center_prototypes = true       # remove the shared "ECG-ness" direction (sharpens classes)
+align_lambda = 1.0             # auxiliary prototype-alignment loss (the text prior)
+kdsp_lambda = 0.3              # KDSP distillation into the MAIN head (keep small)
 sccm_lambda = 0.0              # SCCM (needs learnable text prompt); 0 = off
 
 [models.medtsllm.llm]
